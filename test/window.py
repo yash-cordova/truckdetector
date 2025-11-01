@@ -1,951 +1,18 @@
-import sys
-import warnings
-import os
-
-# Fix FFmpeg async lock errors by setting environment before importing OpenCV
-os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
-os.environ["OPENCV_VIDEOIO_PRIORITY_INTEL_MFX"] = "0"
-os.environ["OPENCV_VIDEOIO_PRIORITY_GSTREAMER"] = "0"
-os.environ["OPENCV_VIDEOIO_BACKEND"] = "CAP_ANY"
-os.environ["OPENCV_THREADS"] = "1"
-
-warnings.filterwarnings("ignore", category=FutureWarning)
+# MainWindow class extracted from main.py
+# Imports
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QWidget,
-    QFileDialog,
-    QLabel,
-    QPushButton,
-    QLineEdit,
-    QHBoxLayout,
-    QVBoxLayout,
-    QSplitter,
-    QGroupBox,
-    QFormLayout,
-    QSizePolicy,
-    QCheckBox,
-    QSlider,
-)
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QMutex, QWaitCondition
+from PyQt5.QtWidgets import (QMainWindow, QWidget, QFileDialog, QLabel, QPushButton, QLineEdit, QHBoxLayout, QVBoxLayout, QSplitter, QGroupBox, QFormLayout, QSizePolicy, QCheckBox, QSlider)
+from PyQt5.QtCore import Qt, QTimer, QMutex
 import cv2
-import numpy as np
-from detector import YoloV5Detector, CLASS_NAMES
+import time
 import json
 import queue
-import time
 import threading
-from collections import defaultdict
-from scipy.optimize import linear_sum_assignment
-
-
-class KalmanFilter:
-    """Enhanced Kalman Filter for object tracking with better motion prediction"""
-    
-    def __init__(self, x, y, w, h, class_id=0):
-        # State vector: [x, y, w, h, vx, vy, vw, vh]
-        self.state = np.array([x, y, w, h, 0, 0, 0, 0], dtype=np.float32)
-        self.class_id = class_id
-        
-        # State transition matrix with acceleration
-        self.F = np.eye(8, dtype=np.float32)
-        self.F[0, 4] = 1  # x += vx
-        self.F[1, 5] = 1  # y += vy
-        self.F[2, 6] = 1  # w += vw
-        self.F[3, 7] = 1  # h += vh
-        
-        # Measurement matrix (we observe x, y, w, h)
-        self.H = np.zeros((4, 8), dtype=np.float32)
-        self.H[0, 0] = 1
-        self.H[1, 1] = 1
-        self.H[2, 2] = 1
-        self.H[3, 3] = 1
-        
-        # Class-specific process noise
-        if class_id == 0:  # person - more unpredictable
-            self.Q = np.eye(8, dtype=np.float32) * 0.5
-            self.R = np.eye(4, dtype=np.float32) * 2.0
-        else:  # vehicles - more predictable
-            self.Q = np.eye(8, dtype=np.float32) * 0.2
-            self.R = np.eye(4, dtype=np.float32) * 1.0
-        
-        # Error covariance
-        self.P = np.eye(8, dtype=np.float32) * 1000
-        
-        self.age = 0
-        self.time_since_update = 0
-        self.velocity_history = []  # Track velocity changes
-        self.stationary_frames = 0  # Track consecutive stationary frames
-        self.last_position = np.array([x, y], dtype=np.float32)
-        
-    def predict(self):
-        """Predict next state with velocity decay for stationary objects"""
-        # Check if object appears to be stationary
-        current_position = self.state[:2]
-        position_change = np.linalg.norm(current_position - self.last_position)
-        
-        if position_change < 2:  # Moving less than 2 pixels
-            self.stationary_frames += 1
-            # Decay velocity if stationary for multiple frames
-            if self.stationary_frames > 3:
-                # Strongly decay velocity towards zero
-                self.state[4] *= 0.5  # vx
-                self.state[5] *= 0.5  # vy
-                self.state[6] *= 0.5  # vw
-                self.state[7] *= 0.5  # vh
-        else:
-            self.stationary_frames = 0
-        
-        self.last_position = current_position.copy()
-        self.state = self.F @ self.state
-        self.P = self.F @ self.P @ self.F.T + self.Q
-        self.age += 1
-        self.time_since_update += 1
-        
-    def update(self, measurement):
-        """Update with measurement and track velocity changes"""
-        # Kalman gain
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-        
-        # Update state
-        innovation = measurement - (self.H @ self.state)
-        self.state = self.state + K @ innovation
-        self.P = (np.eye(8) - K @ self.H) @ self.P
-        
-        # Track velocity changes for adaptive prediction
-        current_velocity = self.state[4:6].copy()
-        self.velocity_history.append(current_velocity)
-        
-        # Keep only recent velocity history
-        if len(self.velocity_history) > 10:
-            self.velocity_history = self.velocity_history[-10:]
-        
-        # Check for stationary state when getting measurement updates
-        current_pos = self.state[:2]
-        pos_change = np.linalg.norm(current_pos - self.last_position)
-        
-        if pos_change < 3:  # Object hasn't moved much
-            # Reduce velocity estimate based on actual movement
-            self.state[4] = current_pos[0] - self.last_position[0]  # vx = actual dx
-            self.state[5] = current_pos[1] - self.last_position[1]  # vy = actual dy
-        
-        self.last_position = current_pos.copy()
-        self.stationary_frames = 0  # Reset stationary counter on update
-        self.time_since_update = 0
-        
-    def get_state(self):
-        """Get current state as [x, y, w, h]"""
-        return self.state[:4].copy()
-        
-    def get_velocity(self):
-        """Get velocity as [vx, vy]"""
-        return self.state[4:6].copy()
-
-
-class Track:
-    """Individual track object"""
-    
-    def __init__(self, track_id, detection, frame_id):
-        x1, y1, x2, y2, conf, cls = detection
-        x, y, w, h = x1, y1, x2 - x1, y2 - y1
-        
-        self.track_id = track_id
-        self.class_id = cls
-        self.confidence = conf
-        self.kalman = KalmanFilter(x, y, w, h, cls)  # Pass class_id to Kalman filter
-        self.last_detection = detection
-        self.frame_id = frame_id
-        self.age = 1
-        self.time_since_update = 0
-        self.state = 'Tentative'  # Tentative, Confirmed, Deleted
-        self.missed_frames = 0  # Track consecutive missed frames
-        
-    def predict(self):
-        """Predict next position"""
-        self.kalman.predict()
-        self.age += 1
-        self.time_since_update += 1
-        
-    def update(self, detection, frame_id):
-        """Update track with new detection"""
-        x1, y1, x2, y2, conf, cls = detection
-        x, y, w, h = x1, y1, x2 - x1, y2 - y1
-        measurement = np.array([x, y, w, h], dtype=np.float32)
-        
-        self.kalman.update(measurement)
-        self.last_detection = detection
-        self.frame_id = frame_id
-        self.time_since_update = 0
-        self.confidence = conf
-        
-        # Promote to confirmed after 3 updates
-        if self.age >= 3:
-            self.state = 'Confirmed'
-            
-    def get_bbox(self):
-        """Get bounding box as [x1, y1, x2, y2]"""
-        x, y, w, h = self.kalman.get_state()
-        return [x, y, x + w, y + h]
-        
-    def get_center(self):
-        """Get center point"""
-        x, y, w, h = self.kalman.get_state()
-        return [x + w/2, y + h/2]
-
-
-# Removed OCSortTracker - no tracking needed
-
-class OCSortTracker_REMOVED:
-    """OC-SORT (Object-Centric SORT) tracker with threading support"""
-    
-    def __init__(self, max_age=30, min_hits=3, iou_threshold=0.2, 
-                 distance_threshold=100, velocity_threshold=50):
-        self.max_age = max_age
-        self.min_hits = min_hits
-        self.iou_threshold = iou_threshold
-        self.distance_threshold = distance_threshold
-        self.velocity_threshold = velocity_threshold
-        
-        self.tracks = {}
-        self.next_id = 1
-        self.frame_count = 0
-        
-        # Class-specific thresholds for better tracking
-        self.class_thresholds = {
-            0: {"distance": 80, "velocity": 40, "iou": 0.15},  # person - more flexible
-            1: {"distance": 60, "velocity": 30, "iou": 0.25},  # forklift
-            2: {"distance": 50, "velocity": 20, "iou": 0.3}    # truck - more strict
-        }
-        
-        # Thread safety
-        self.mutex = threading.Lock()
-        
-    def update(self, detections, frame_id):
-        """Update tracker with new detections"""
-        with self.mutex:
-            self.frame_count = frame_id
-            
-            # Predict all tracks
-            for track in self.tracks.values():
-                track.predict()
-                
-            # Associate detections with tracks
-            matched_tracks, unmatched_detections, unmatched_tracks = self._associate_detections(
-                detections, self.tracks
-            )
-            
-            # Update matched tracks
-            for track_id, detection_idx in matched_tracks:
-                track = self.tracks[track_id]
-                track.update(detections[detection_idx], frame_id)
-                
-            # Create new tracks for unmatched detections
-            for detection_idx in unmatched_detections:
-                track_id = self.next_id
-                self.next_id += 1
-                track = Track(track_id, detections[detection_idx], frame_id)
-                self.tracks[track_id] = track
-                print(f"OC-SORT: Created new track {track_id} for detection {detection_idx} (class {detections[detection_idx][5]})")
-                
-            # Remove old tracks
-            tracks_to_remove = []
-            for track_id, track in self.tracks.items():
-                if track.time_since_update > self.max_age:
-                    tracks_to_remove.append(track_id)
-                    print(f"OC-SORT: Removing old track {track_id} (class {track.class_id}) after {track.time_since_update} frames")
-                    
-            for track_id in tracks_to_remove:
-                del self.tracks[track_id]
-                
-            # Return confirmed tracks with IDs
-            confirmed_tracks = []
-            for track in self.tracks.values():
-                if track.state == 'Confirmed':
-                    bbox = track.get_bbox()
-                    track_data = (
-                        bbox[0], bbox[1], bbox[2], bbox[3],  # x1, y1, x2, y2
-                        track.confidence,                    # confidence
-                        track.class_id,                      # class
-                        track.track_id                       # track ID
-                    )
-                    confirmed_tracks.append(track_data)
-                    
-            return confirmed_tracks
-            
-    def _associate_detections(self, detections, tracks):
-        """Associate detections with tracks using Hungarian algorithm"""
-        if not detections or not tracks:
-            return [], list(range(len(detections))), list(tracks.keys())
-            
-        # Calculate cost matrix
-        cost_matrix = self._calculate_cost_matrix(detections, tracks)
-        
-        # Use Hungarian algorithm for optimal assignment
-        track_indices, detection_indices = linear_sum_assignment(cost_matrix)
-        
-        # Filter assignments based on cost threshold
-        matched_tracks = []
-        unmatched_detections = list(range(len(detections)))
-        unmatched_tracks = list(tracks.keys())
-        
-        for track_idx, detection_idx in zip(track_indices, detection_indices):
-            # Get class-specific threshold
-            track_id = list(tracks.keys())[track_idx]
-            track = tracks[track_id]
-            detection = detections[detection_idx]
-            
-            # Use class-specific thresholds
-            class_id = track.class_id
-            thresholds = self.class_thresholds.get(class_id, {
-                "distance": self.distance_threshold, 
-                "velocity": self.velocity_threshold, 
-                "iou": self.iou_threshold
-            })
-            
-            if cost_matrix[track_idx, detection_idx] < thresholds["distance"]:
-                matched_tracks.append((track_id, detection_idx))
-                unmatched_detections.remove(detection_idx)
-                unmatched_tracks.remove(track_id)
-                print(f"OC-SORT: Matched track {track_id} (class {class_id}) with detection {detection_idx}, cost: {cost_matrix[track_idx, detection_idx]:.2f}")
-            else:
-                print(f"OC-SORT: Rejected match track {track_id} (class {class_id}) with detection {detection_idx}, cost: {cost_matrix[track_idx, detection_idx]:.2f} > {thresholds['distance']}")
-                
-        return matched_tracks, unmatched_detections, unmatched_tracks
-        
-    def _calculate_cost_matrix(self, detections, tracks):
-        """Calculate cost matrix between detections and tracks"""
-        cost_matrix = np.full((len(tracks), len(detections)), float('inf'))
-        
-        for i, (track_id, track) in enumerate(tracks.items()):
-            track_bbox = track.get_bbox()
-            track_center = track.get_center()
-            
-            # Get class-specific thresholds for this track
-            class_id = track.class_id
-            thresholds = self.class_thresholds.get(class_id, {
-                "distance": self.distance_threshold, 
-                "velocity": self.velocity_threshold, 
-                "iou": self.iou_threshold
-            })
-            
-            for j, detection in enumerate(detections):
-                x1, y1, x2, y2, conf, cls = detection
-                detection_center = [(x1 + x2) / 2, (y1 + y2) / 2]
-                
-                # Calculate IoU
-                iou = self._calculate_iou(track_bbox, [x1, y1, x2, y2])
-                
-                # Calculate distance
-                distance = np.sqrt(
-                    (track_center[0] - detection_center[0])**2 + 
-                    (track_center[1] - detection_center[1])**2
-                )
-                
-                # Calculate velocity consistency
-                velocity_cost = self._calculate_velocity_cost(track, detection)
-                
-                # Combined cost (lower is better) with class-specific thresholds
-                if iou > thresholds["iou"]:
-                    # Weighted cost based on class type
-                    if class_id == 0:  # person - prioritize distance over velocity
-                        cost = distance * 0.7 + velocity_cost * 0.3
-                    else:  # vehicles - more balanced
-                        cost = distance * 0.5 + velocity_cost * 0.5
-                    
-                    # Penalize high costs for stationary objects to prevent ID switching
-                    if track.kalman.stationary_frames > 5:
-                        # If object has been stationary, apply additional penalty for distant detections
-                        # This prevents the track from "jumping" to a new detection
-                        cost = cost * (1 + track.kalman.stationary_frames * 0.1)
-                else:
-                    cost = float('inf')
-                    
-                cost_matrix[i, j] = cost
-                
-        return cost_matrix
-        
-    def _calculate_iou(self, bbox1, bbox2):
-        """Calculate Intersection over Union"""
-        x1_1, y1_1, x2_1, y2_1 = bbox1
-        x1_2, y1_2, x2_2, y2_2 = bbox2
-        
-        # Calculate intersection
-        x1_i = max(x1_1, x1_2)
-        y1_i = max(y1_1, y1_2)
-        x2_i = min(x2_1, x2_2)
-        y2_i = min(y2_1, y2_2)
-        
-        if x2_i <= x1_i or y2_i <= y1_i:
-            return 0.0
-            
-        intersection = (x2_i - x1_i) * (y2_i - y1_i)
-        
-        # Calculate union
-        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
-        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
-        union = area1 + area2 - intersection
-        
-        return intersection / union if union > 0 else 0.0
-        
-    def _calculate_velocity_cost(self, track, detection):
-        """Calculate velocity consistency cost with class-specific handling"""
-        if track.age < 2:
-            return 0
-            
-        # Get predicted position
-        predicted_bbox = track.get_bbox()
-        predicted_center = [(predicted_bbox[0] + predicted_bbox[2]) / 2,
-                           (predicted_bbox[1] + predicted_bbox[3]) / 2]
-        
-        # Get detection center
-        x1, y1, x2, y2, conf, cls = detection
-        detection_center = [(x1 + x2) / 2, (y1 + y2) / 2]
-        
-        # Calculate velocity difference
-        velocity_diff = np.sqrt(
-            (predicted_center[0] - detection_center[0])**2 + 
-            (predicted_center[1] - detection_center[1])**2
-        )
-        
-        # Get class-specific velocity threshold
-        class_id = track.class_id
-        thresholds = self.class_thresholds.get(class_id, {
-            "velocity": self.velocity_threshold
-        })
-        
-        # Apply class-specific velocity penalty
-        if class_id == 0:  # person - more forgiving for direction changes
-            return min(velocity_diff * 0.5, thresholds["velocity"])
-        else:  # vehicles - more strict
-            return min(velocity_diff, thresholds["velocity"])
-
-
-class DetectionThread(QThread):
-    """Separate thread for running YOLO detection"""
-    detection_complete = pyqtSignal(np.ndarray, list, int)  # frame, detections, frame_number
-    
-    def __init__(self, detector, roi=None):
-        super().__init__()
-        self.detector = detector
-        self.roi = roi
-        self.running = False
-        self.mutex = QMutex()
-        self.detection_queue = queue.Queue(maxsize=30)  # Larger queue
-        self.last_frame_time = time.time()
-        self.frame_count = 0
-        
-    def add_frame(self, frame, frame_number):
-        """Add frame for detection processing"""
-        try:
-            self.detection_queue.put_nowait((frame, frame_number))
-        except queue.Full:
-            # Remove oldest frame to make room
-            try:
-                self.detection_queue.get_nowait()
-                self.detection_queue.put_nowait((frame, frame_number))
-            except:
-                pass  # Skip frame if still failing
-            
-    def set_roi(self, roi):
-        self.mutex.lock()
-        self.roi = roi
-        self.mutex.unlock()
-        
-    def run(self):
-        self.running = True
-        print("DetectionThread: Starting detection processing")
-        
-        while self.running:
-            try:
-                # Get frame with timeout
-                try:
-                    frame, frame_number = self.detection_queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                
-                # Process detection
-                detections = []
-                try:
-                    if self.detector:
-                        self.mutex.lock()
-                        roi = self.roi
-                        self.mutex.unlock()
-                        
-                        # Run detection with timeout protection
-                        try:
-                            detections = self.detector.detect(frame, roi)
-                        except Exception as e:
-                            print(f"YOLO detection error: {e}")
-                            detections = []
-                    
-                    # Track performance
-                    self.frame_count += 1
-                    current_time = time.time()
-                    if self.frame_count % 100 == 0:
-                        elapsed = current_time - self.last_frame_time
-                        fps = 100 / elapsed if elapsed > 0 else 0
-                        print(f"DetectionThread: Processed {self.frame_count} frames, avg FPS: {fps:.2f}")
-                        self.last_frame_time = current_time
-                    
-                    # Emit results
-                    self.detection_complete.emit(frame, detections or [], frame_number)
-                    
-                except Exception as e:
-                    print(f"Detection processing error: {e}")
-                    try:
-                        self.detection_complete.emit(frame, [], frame_number)
-                    except:
-                        pass
-                
-                try:
-                    self.detection_queue.task_done()
-                except:
-                    pass
-                
-            except Exception as e:
-                print(f"DetectionThread error: {e}")
-                import traceback
-                traceback.print_exc()
-                
-        print("DetectionThread: Finished")
-        
-    def stop(self):
-        self.running = False
-
-
-class TrackingThread(QThread):
-    """Separate thread for OC-SORT tracking"""
-    tracking_complete = pyqtSignal(np.ndarray, list, int)  # frame, tracked_detections, frame_number
-    
-    def __init__(self, ocsort_tracker):
-        super().__init__()
-        self.ocsort_tracker = ocsort_tracker
-        self.running = False
-        self.tracking_queue = queue.Queue(maxsize=10)
-        
-    def add_detection(self, frame, detections, frame_number):
-        """Add detection for tracking processing"""
-        try:
-            self.tracking_queue.put_nowait((frame, detections, frame_number))
-        except queue.Full:
-            # Skip if queue is full
-            pass
-            
-    def run(self):
-        self.running = True
-        print("TrackingThread: Starting tracking processing")
-        
-        while self.running:
-            try:
-                frame, detections, frame_number = self.tracking_queue.get(timeout=0.1)
-                
-                # Run OC-SORT tracking
-                tracked_detections = self.ocsort_tracker.update(detections, frame_number)
-                self.tracking_complete.emit(frame, tracked_detections, frame_number)
-                
-                self.tracking_queue.task_done()
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"TrackingThread error: {e}")
-                
-        print("TrackingThread: Finished")
-        
-    def stop(self):
-        self.running = False
-
-
-class SimpleVideoProcessor(QThread):
-    """Simple single-threaded video processor - no complex queues"""
-    frame_ready = pyqtSignal(np.ndarray, list, int)  # frame, tracked_detections, frame_number
-    
-    def __init__(self, video_path, detector, roi=None, start_frame=0, frame_skip_interval=1):
-        super().__init__()
-        self.video_path = video_path
-        self.detector = detector
-        self.roi = roi  # Not used anymore but kept for compatibility
-        self.running = False
-        self.cap = None
-        self.start_frame = start_frame
-        self.current_frame = 0
-        self.last_detections = []  # Cache last detections (fallback only)
-        self.mutex = QMutex()  # Thread-safe access to last_detections
-        self.frame_skip_interval = frame_skip_interval  # Frame skip interval from config
-        self.frame_skip_count = 0  # Counter for frame skipping
-        
-    def run(self):
-        self.running = True
-        print("SimpleVideoProcessor: Starting")
-        
-        try:
-            # Open video
-            self.cap = cv2.VideoCapture(self.video_path)
-            if not self.cap.isOpened():
-                print("Failed to open video")
-                return
-            
-            # Set buffer size to 1 to avoid FFmpeg issues
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            
-            # Seek to start frame if specified
-            if self.start_frame > 0:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
-                self.current_frame = self.start_frame
-                print(f"Seeking to frame {self.start_frame}")
-            
-            while self.running:
-                try:
-                    ret, frame = self.cap.read()
-                    if not ret:
-                        # Loop video
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        self.current_frame = 0
-                        continue
-                    
-                    # Run detection based on frame_skip_interval from config
-                    # This allows skipping frames for performance while maintaining smooth display
-                    if self.detector:
-                        if self.frame_skip_count % self.frame_skip_interval == 0:
-                            # Run detection on selected frames (based on config)
-                            detections = self.detector.detect(frame, roi=None)
-                            
-                            # Cache detections for skipped frames
-                            self.mutex.lock()
-                            self.last_detections = detections
-                            self.mutex.unlock()
-                        else:
-                            # Use cached detections for skipped frames
-                            self.mutex.lock()
-                            detections = self.last_detections
-                            self.mutex.unlock()
-                    else:
-                        detections = []
-                    
-                    # Emit results (always emit frame, with fresh or cached detections)
-                    self.frame_ready.emit(frame, detections, self.current_frame)
-                    
-                    # Increment frame skip counter
-                    self.frame_skip_count += 1
-                    
-                    self.current_frame += 1
-                    
-                    # Small delay to control speed
-                    self.msleep(20)  # ~50 FPS display (allows fast playback)
-                    
-                except Exception as e:
-                    print(f"SimpleVideoProcessor frame error: {e}")
-                    if not self.cap or not self.cap.isOpened():
-                        break
-                    self.current_frame += 1
-                    
-        except Exception as e:
-            print(f"SimpleVideoProcessor error: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            if self.cap:
-                self.cap.release()
-                print("SimpleVideoProcessor: Released video capture")
-        
-        print("SimpleVideoProcessor: Finished")
-    
-    def stop(self):
-        self.running = False
-
-
-class YoloProcessorThread(QThread):
-    """Thread for YOLO detection processing"""
-    detection_ready = pyqtSignal(np.ndarray, list, int)  # frame, detections, frame_number
-    
-    def __init__(self, detector, shared_buffer, roi=None, use_ocsort=False):
-        super().__init__()
-        self.detector = detector
-        self.shared_buffer = shared_buffer
-        self.roi = roi
-        self.use_ocsort = use_ocsort
-        self.running = False
-        self.mutex = QMutex()
-        self.roi_mutex = QMutex()
-        
-    def set_roi(self, roi):
-        self.roi_mutex.lock()
-        self.roi = roi
-        self.roi_mutex.unlock()
-        
-    def run(self):
-        self.running = True
-        print("YoloProcessorThread: Starting")
-        
-        while self.running:
-            try:
-                # Get frame from buffer with timeout
-                try:
-                    frame, frame_number = self.shared_buffer.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    print(f"Buffer get error: {e}")
-                    continue
-                
-                # Run detection if detector available
-                detections = []
-                if self.detector:
-                    try:
-                        self.roi_mutex.lock()
-                        roi = self.roi
-                        self.roi_mutex.unlock()
-                        
-                        detections = self.detector.detect(frame, roi)
-                    except Exception as e:
-                        print(f"Detection error: {e}")
-                        import traceback
-                        traceback.print_exc()
-                
-                # Emit detection results
-                try:
-                    self.detection_ready.emit(frame, detections or [], frame_number)
-                except Exception as e:
-                    print(f"Signal emit error: {e}")
-                
-                try:
-                    self.shared_buffer.task_done()
-                except:
-                    pass  # Ignore task_done errors
-                
-            except Exception as e:
-                print(f"YoloProcessorThread error: {e}")
-                import traceback
-                traceback.print_exc()
-                
-        print("YoloProcessorThread: Finished")
-        
-    def stop(self):
-        self.running = False
-
-
-class FrameCollectorThread(QThread):
-    frame_ready = pyqtSignal(np.ndarray, int)  # frame, frame_number
-    
-    def __init__(self, video_path, shared_buffer, buffer_size=10):
-        super().__init__()
-        self.video_path = video_path
-        self.buffer_size = buffer_size
-        self.shared_buffer = shared_buffer
-        self.cap = None
-        self.running = False
-        self.skip_frames = False
-        self.mutex = QMutex()
-        self.condition = QWaitCondition()
-        self.start_frame = 0  # Frame to start from
-        self.max_failures = 3  # Track consecutive read failures
-        self.failure_count = 0
-        
-    def set_skip_frames(self, skip):
-        self.mutex.lock()
-        self.skip_frames = skip
-        self.mutex.unlock()
-        
-        
-    def run(self):
-        try:
-            if not self.video_path:
-                print("FrameCollector: No video path provided")
-                return
-                
-            print(f"FrameCollector: Opening video: {self.video_path}")
-            # Open with specific flags to avoid FFmpeg threading issues
-            self.cap = cv2.VideoCapture(self.video_path)
-            
-            # Try to set backend explicitly to avoid threading issues
-            try:
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except:
-                pass
-                
-            if not self.cap.isOpened():
-                print("FrameCollector: Failed to open video")
-                return
-                
-            self.running = True
-            frame_number = self.start_frame
-            print(f"FrameCollector: Starting frame collection from frame {frame_number}")
-            
-            # Set starting position
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
-            
-            while self.running:
-                try:
-                    ret, frame = self.cap.read()
-                    if not ret:
-                        # End of video - loop back to start
-                        print(f"FrameCollector: End of video at frame {frame_number}, looping back to start")
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        frame_number = 0
-                        self.failure_count = 0
-                        
-                        # Try to read first frame after loop
-                        ret, frame = self.cap.read()
-                        if not ret:
-                            self.failure_count += 1
-                            print(f"FrameCollector: Could not read after loop (failure {self.failure_count}/{self.max_failures})")
-                            if self.failure_count >= self.max_failures:
-                                print("FrameCollector: Too many read failures after loop")
-                                break
-                        continue
-                        
-                    self.failure_count = 0  # Reset on successful read
-                    
-                    self.mutex.lock()
-                    try:
-                        if self.skip_frames:
-                            # Skip frame if buffer is full
-                            if self.shared_buffer.full():
-                                frame_number += 1
-                                continue
-                        else:
-                            # Wait if buffer is full
-                            wait_count = 0
-                            while self.shared_buffer.full() and self.running and wait_count < 100:
-                                self.condition.wait(self.mutex, 10)
-                                wait_count += 1
-                                
-                        if self.running and not self.shared_buffer.full():
-                            try:
-                                # Try to put frame in buffer
-                                self.shared_buffer.put_nowait((frame.copy(), frame_number))
-                                self.frame_ready.emit(frame, frame_number)
-                                frame_number += 1
-                            except queue.Full:
-                                # Buffer became full while we checked
-                                pass
-                            except Exception as e:
-                                print(f"Error putting frame in buffer: {e}")
-                    finally:
-                        self.mutex.unlock()
-                except Exception as e:
-                    print(f"FrameCollector frame reading error: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    self.failure_count += 1
-                    if self.failure_count >= self.max_failures:
-                        break
-                    
-            print("FrameCollector: Thread finished")
-        except Exception as e:
-            print(f"FrameCollector error: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            try:
-                if self.cap:
-                    self.cap.release()
-                    print("FrameCollector: Released video capture")
-            except Exception as e:
-                print(f"Error releasing capture: {e}")
-                
-    def stop(self):
-        self.running = False
-        try:
-            self.condition.wakeAll()
-        except:
-            pass
-        try:
-            if self.cap:
-                self.cap.release()
-        except:
-            pass
-
-
-
-
-class VideoCanvas(QLabel):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAlignment(Qt.AlignCenter)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self._frame = None
-        self.roi = None  # (x1, y1, x2, y2) - bounding box for compatibility
-        self.roi_corners = None  # List of 4 corners for polygon
-
-    def set_frame(self, frame_bgr):
-        self._frame = frame_bgr
-        self.update()
-
-    def set_roi(self, roi):
-        self.roi = roi
-        self.update()
-
-    def set_roi_corners(self, corners):
-        self.roi_corners = corners
-        self.update()
-        
-    def set_parking_line_points(self, points):
-        self.parking_line_points = points
-        self.update()
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if self._frame is None:
-            return
-
-        frame = self._frame
-        h, w, _ = frame.shape
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        qimg = QtGui.QImage(rgb.data, w, h, rgb.strides[0], QtGui.QImage.Format_RGB888)
-        pix = QtGui.QPixmap.fromImage(qimg)
-
-        painter = QtGui.QPainter(self)
-        try:
-            # scale to fit
-            target = self.rect()
-            scaled = pix.scaled(target.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            x = (target.width() - scaled.width()) // 2
-            y = (target.height() - scaled.height()) // 2
-            painter.drawPixmap(x, y, scaled)
-
-            # Draw ROI polygon if corners are available
-            if self.roi_corners is not None and len(self.roi_corners) >= 3:
-                scale = min(target.width() / w, target.height() / h)
-                points = []
-                for corner_x, corner_y in self.roi_corners:
-                    sx = x + int(corner_x * scale)
-                    sy = y + int(corner_y * scale)
-                    points.append(QtCore.QPoint(sx, sy))
-                
-                pen = QtGui.QPen(QtGui.QColor(0, 255, 0), 2)
-                painter.setPen(pen)
-                painter.drawPolygon(points)
-            elif self.roi is not None:
-                # Fallback to rectangle
-                x1, y1, x2, y2 = self.roi
-                scale = min(target.width() / w, target.height() / h)
-                sx = x + int(x1 * scale)
-                sy = y + int(y1 * scale)
-                ex = x + int(x2 * scale)
-                ey = y + int(y2 * scale)
-                pen = QtGui.QPen(QtGui.QColor(0, 255, 0), 2)
-                painter.setPen(pen)
-                painter.drawRect(QtCore.QRect(QtCore.QPoint(sx, sy), QtCore.QPoint(ex, ey)))
-                
-            # Draw parking line if points are available
-            if hasattr(self, 'parking_line_points') and self.parking_line_points is not None and len(self.parking_line_points) == 2:
-                scale = min(target.width() / w, target.height() / h)
-                p1_x, p1_y = self.parking_line_points[0]
-                p2_x, p2_y = self.parking_line_points[1]
-                sp1_x = x + int(p1_x * scale)
-                sp1_y = y + int(p1_y * scale)
-                sp2_x = x + int(p2_x * scale)
-                sp2_y = y + int(p2_y * scale)
-                
-                pen = QtGui.QPen(QtGui.QColor(255, 0, 0), 3)  # Red line
-                painter.setPen(pen)
-                painter.drawLine(sp1_x, sp1_y, sp2_x, sp2_y)
-        finally:
-            painter.end()
-
+from detector import YoloV5Detector, CLASS_NAMES
+from canvas import VideoCanvas
+from threads import SimpleVideoProcessor
+from detection_utils import draw_detections_with_ids
+from monitoring import TruckMonitor
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -997,13 +64,11 @@ class MainWindow(QMainWindow):
         self.debug_timer.start(1000)  # Every 1 second
         self.last_debug_data = {}  # Store last debug data
         
-        # Truck monitoring state
-        self.truck_state = "NO_TRUCK"  # NO_TRUCK, TRUCK_DETECTED, TOUCHED_LINE, PARKED
-        self.last_truck_position = None
+        # Truck monitoring - use TruckMonitor class
         self.parking_line_y = None  # Will be set based on ROI
         self.parking_line_points = None  # Will be set based on user input
-        self.parking_timer_start = None  # Time when truck touched parking line
         self.parking_duration_seconds = None  # Will be loaded from config.json
+        self.truck_monitor = None  # Will be initialized after config loads
         
         # OC-SORT tracking configuration
         self.use_ocsort_tracking = True  # Enable OC-SORT tracking
@@ -1894,60 +959,10 @@ class MainWindow(QMainWindow):
 
 
     def _draw_detections_with_ids(self, frame, detections):
-        """Draw detections with unique IDs and confidence scores
-        
-        Only draws bounding boxes that touch or are inside the ROI.
-        If object is partially in ROI, draws the FULL bounding box.
-        """
+        """Draw detections with unique IDs and confidence scores - uses utility function"""
         if not detections or not self.detector:
             return frame
-            
-        # Create a copy of the frame to draw on
-        frame_copy = frame.copy()
-        
-        # Get ROI bounds for filtering
-        roi = self.video_canvas.roi
-        roi_x1, roi_y1, roi_x2, roi_y2 = roi if roi else (0, 0, frame.shape[1], frame.shape[0])
-        
-        for detection in detections:
-            if len(detection) >= 7:  # Has unique ID
-                x1, y1, x2, y2, conf, class_id, obj_id = detection[:7]
-            else:  # No unique ID (fallback)
-                x1, y1, x2, y2, conf, class_id = detection[:6]
-                obj_id = "N/A"
-            
-            # Check if detection touches or overlaps with ROI
-            # Detection overlaps if: not completely outside ROI
-            bbox_touches_roi = not (x2 < roi_x1 or x1 > roi_x2 or y2 < roi_y1 or y1 > roi_y2)
-            
-            # Only draw if touching ROI
-            if not bbox_touches_roi:
-                continue  # Skip this detection
-            
-            # Get class name
-            class_name = self.model_names.get(class_id, f"Class_{class_id}")
-            
-            # Create label with format: "ObjectName ID:123 conf:0.85"
-            if obj_id != "N/A":
-                label = f"{class_name} ID:{obj_id} conf:{conf:.2f}"
-            else:
-                label = f"{class_name} conf:{conf:.2f}"
-            
-            # Draw FULL bounding box (even if partially outside ROI)
-            cv2.rectangle(frame_copy, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            
-            # Draw label background
-            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-            cv2.rectangle(frame_copy, (int(x1), int(y1) - label_size[1] - 10), 
-                        (int(x1) + label_size[0], int(y1)), (0, 255, 0), -1)
-            
-            # Draw label text
-            cv2.putText(frame_copy, label, (int(x1), int(y1) - 5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-            
-            # Bottom-center dot removed for cleaner display
-        
-        return frame_copy
+        return draw_detections_with_ids(frame, detections, self.model_names, self.video_canvas.roi)
         
     def _assign_unique_ids(self, detections):
         """Assign unique IDs to detections based on position and class"""
@@ -2009,16 +1024,10 @@ class MainWindow(QMainWindow):
         return current_frame_objects
         
     def _process_truck_monitoring(self, detections, frame):
-        """Main truck monitoring logic"""
-        # Store debug data for periodic printing
-        self.last_debug_data = {
-            'detections': len(detections) if detections else 0,
-            'truck_state': self.truck_state,
-            'roi': self.video_canvas.roi,
-            'parking_line_y': self.parking_line_y,
-            'detections_detail': detections if detections else []
-        }
-        
+        """Main truck monitoring logic - uses TruckMonitor class"""
+        if not self.truck_monitor:
+            return
+            
         # Format: (x1, y1, x2, y2, conf, class_id, track_id) or (x1, y1, x2, y2, conf, class_id)
         
         # Separate trucks, persons, and forklifts
@@ -2026,14 +1035,36 @@ class MainWindow(QMainWindow):
         persons = [d for d in detections if d[5] == 0]  # Class 0 is person
         forklifts = [d for d in detections if d[5] == 1]  # Class 1 is forklift
         
-        # STEP 1: Update Truck State
-        self._update_truck_state(trucks)
+        # Calculate person dots for debug info
+        person_dots = []
+        for person in persons if persons else []:
+            px1, py1, px2, py2 = person[:4]
+            person_bottom_center_x = (px1 + px2) / 2
+            person_bottom_y = py2
+            person_dots.append((person_bottom_center_x, person_bottom_y))
         
-        # STEP 2: Check Person Violations (returns boolean)
-        has_violation = self._check_person_violations(persons, trucks)
+        # Store debug data for periodic printing
+        self.last_debug_data = {
+            'detections': len(detections) if detections else 0,
+            'truck_state': self.truck_monitor.truck_state if self.truck_monitor else 'UNKNOWN',
+            'roi': self.video_canvas.roi,
+            'parking_line_y': self.parking_line_y,
+            'detections_detail': detections if detections else [],
+            'person_dots': person_dots
+        }
+        
+        # Get ROI and ROI corners for monitoring
+        roi = self.video_canvas.roi
+        roi_corners = self.video_canvas.roi_corners if hasattr(self.video_canvas, 'roi_corners') else None
+        
+        # STEP 1: Update Truck State using TruckMonitor
+        self.truck_monitor.update_truck_state(trucks, roi, self.parking_line_y)
+        
+        # STEP 2: Check Person Violations using TruckMonitor
+        has_violation = self.truck_monitor.check_person_violations(persons, trucks, roi, roi_corners)
         
         # STEP 3: Check for persons/forklifts in ROI when no truck
-        has_person_or_forklift_in_roi = self._check_person_or_forklift_in_roi(persons, forklifts)
+        has_person_or_forklift_in_roi = self.truck_monitor.check_person_or_forklift_in_roi(persons, forklifts, roi)
         
         # STEP 4: Update UI
         self._update_status_display(has_violation, has_person_or_forklift_in_roi)
@@ -2229,7 +1260,7 @@ class MainWindow(QMainWindow):
         
         roi = self.last_debug_data.get('roi', None)
         person_dots = self.last_debug_data.get('person_dots', [])
-        truck_state = self.last_debug_data.get('truck_state', 'UNKNOWN')
+        truck_state = self.truck_monitor.truck_state if self.truck_monitor else self.last_debug_data.get('truck_state', 'UNKNOWN')
         
         print("\n" + "="*60)
         print(f"DEBUG (Every 1 sec) - Truck State: {truck_state}")
@@ -2260,32 +1291,13 @@ class MainWindow(QMainWindow):
         # Store violation status in debug data
         self.last_debug_data['has_violation'] = has_violation
         
-        if self.truck_state == "NO_TRUCK":
-            if has_person_or_forklift_in_roi:
-                active_light = "green"  # Still green if person/forklift but no truck
-                status_text = "Status: NO_TRUCK"
-            else:
-                active_light = "green"
-                status_text = "Status: NO_TRUCK - Safe"
-        elif self.truck_state == "PARKED":
+        # Get status info from TruckMonitor
+        if self.truck_monitor:
+            active_light, status_text = self.truck_monitor.get_status_info(has_violation, has_person_or_forklift_in_roi)
+        else:
+            # Fallback if truck_monitor not initialized
             active_light = "green"
-            status_text = "Status: PARKED - Safe to start unloading"
-        elif has_violation:
-            # Person's bottom-center dot is in ROI = RED (violation)
-            active_light = "red"
-            status_text = "Status: TRUCK DETECTED - VIOLATION (Person feet in ROI)"
-        elif self.truck_state == "TOUCHED_LINE":
-            active_light = "yellow"  # Yellow because no violation (bottom-center dot not in ROI)
-            # Show countdown if available
-            if self.parking_timer_start is not None:
-                elapsed = time.time() - self.parking_timer_start
-                remaining = max(0, self.parking_duration_seconds - elapsed)
-                status_text = f"Status: TRUCK TOUCHED LINE - Wait {remaining:.1f}s for PARKED"
-            else:
-                status_text = "Status: TRUCK TOUCHED LINE"
-        else:  # TRUCK_DETECTED
-            active_light = "yellow"  # Yellow because no violation (bottom-center dot not in ROI)
-            status_text = "Status: TRUCK DETECTED - Approaching"
+            status_text = "Status: Initializing..."
         
         # Update traffic light
         self._set_traffic_light(active_light)
@@ -2360,9 +1372,8 @@ class MainWindow(QMainWindow):
 
     def _reset_traffic_status(self):
         """Reset traffic status to initial state"""
-        self.truck_state = "NO_TRUCK"
-        self.last_truck_position = None
-        self.parking_timer_start = None
+        if self.truck_monitor:
+            self.truck_monitor.reset()
         self._update_status_display(False, False)
         print("Traffic status reset to initial state")
 
@@ -2625,6 +1636,9 @@ class MainWindow(QMainWindow):
         self.detection_confidence_min = cfg.get("detection_confidence_min", 0.3)
         self.parking_duration_seconds = cfg.get("parking_duration_seconds", 5.0)
         
+        # Initialize truck monitor
+        self.truck_monitor = TruckMonitor(parking_duration_seconds=self.parking_duration_seconds)
+        
         # Load frame skip configuration
         self.frame_skip_interval = cfg.get("frame_skip_interval", 1)
         self.frame_skip_count = 0
@@ -2743,17 +1757,3 @@ class MainWindow(QMainWindow):
             print(f"Error closing video capture on close: {e}")
             
         event.accept()
-
-
-
-def main():
-    app = QApplication(sys.argv)
-    w = MainWindow()
-    w.show()
-    sys.exit(app.exec_())
-
-
-if __name__ == "__main__":
-    main()
-
-

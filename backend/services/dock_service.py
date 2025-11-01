@@ -17,18 +17,26 @@ class DockService:
     async def start_change_stream(self):
         """Start polling mechanism for dock1 collection (since Change Streams require replica set)"""
         try:
+            # Check if MongoDB connection exists
+            if dock1_collection is None:
+                logger.error("MongoDB connection not available. Polling mechanism will not start.")
+                return
+            
             logger.info("Started polling mechanism for dock1 (Change Streams not available in standalone MongoDB)")
             
             last_count = 0
             while True:
                 try:
                     # Poll for changes by counting documents
-                    current_count = dock1_collection.count_documents({'dock_id': 'dock1'})
-                    
-                    if current_count != last_count:
-                        logger.info(f"Dock1 data changed - count: {last_count} -> {current_count}")
-                        await self.handle_polling_change()
-                        last_count = current_count
+                    if dock1_collection is not None:
+                        current_count = dock1_collection.count_documents({'dock_id': 'dock1'})
+                        
+                        if current_count != last_count:
+                            logger.info(f"Dock1 data changed - count: {last_count} -> {current_count}")
+                            await self.handle_polling_change()
+                            last_count = current_count
+                    else:
+                        logger.warning("MongoDB collection not available, skipping poll")
                     
                     # Poll every 2 seconds
                     await asyncio.sleep(2)
@@ -179,6 +187,10 @@ class DockService:
     async def get_current_dock_status(self) -> Dict[str, Any]:
         """Get current dock status from database - latest entry sorted by time with all fields"""
         try:
+            if dock1_collection is None:
+                logger.warning("MongoDB collection not available, returning empty status")
+                return {}
+            
             # Get the latest entry sorted by timestamp
             latest_doc = dock1_collection.find_one(
                 {'dock_id': 'dock1'},
@@ -206,6 +218,10 @@ class DockService:
     async def get_recent_dock_data(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent dock data entries sorted by time (newest first) with all fields"""
         try:
+            if dock1_collection is None:
+                logger.warning("MongoDB collection not available, returning empty list")
+                return []
+            
             # Get recent entries sorted by timestamp (newest first)
             recent_docs = list(dock1_collection.find(
                 {'dock_id': 'dock1'},
