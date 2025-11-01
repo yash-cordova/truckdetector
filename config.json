@@ -1,0 +1,18 @@
+{
+  "weights_path": "best.pt",
+  "inference_size": 640,
+  "confidence_threshold": 0.35,
+  "iou_threshold": 0.45,
+  "violation_threshold": 10,
+  "stationary_threshold": 10,
+  "movement_threshold": 10,
+  "tracking_distance_threshold": 50,
+  "max_tracking_frames": 30,
+  "detection_confidence_min": 0.3,
+  "tracking_enabled": true,
+  "frame_skip_interval": 2,
+  "detection_interval": 1,
+  "buffer_size": 20,
+  "parking_duration_seconds": 10.0
+}
+
