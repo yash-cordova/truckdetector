@@ -4,6 +4,20 @@
   "confidence_threshold": 0.35,
   "iou_threshold": 0.45,
   "parking_duration_seconds": 5.0,
-  "frame_skip_interval": 10
+  "frame_skip_interval": 10,
+  "plc_connection": {
+    "host": "127.0.0.1",
+    "port": 502,
+    "auto_open": true,
+    "auto_close": true
+  },
+  "plc_settings": {
+    "check_interval": 1
+  },
+  "light_settings": {
+    "green_light_coil": [true, false, false, false, false, false, false, false],
+    "red_light_coil": [false, true, false, false, false, false, false, false],
+    "yellow_light_coil": [false, false, true, false, false, false, false, false]
+  }
 }
 
