@@ -7,6 +7,7 @@ import cv2
 import time
 import json
 import threading
+import os
 from detector import YoloV5Detector, CLASS_NAMES
 from canvas import VideoCanvas
 from threads import SimpleVideoProcessor
@@ -360,6 +361,9 @@ class MainWindow(QMainWindow):
         # Preload model before showing GUI
         self._load_model_from_config()
         self._populate_class_checkboxes()
+        
+        # Load video from config and show first frame
+        self._load_video_from_config()
         
         # Initialize and start PLC thread for physical traffic light
         try:
@@ -1555,7 +1559,8 @@ class MainWindow(QMainWindow):
 
     def _load_model_from_config(self):
         try:
-            with open('config.json', 'r') as f:
+            config_path = os.path.join(os.path.dirname(__file__), '..', 'config.json')
+            with open(config_path, 'r') as f:
                 cfg = json.load(f)
         except Exception:
             cfg = {
@@ -1599,6 +1604,65 @@ class MainWindow(QMainWindow):
             self.detector = None
             self.model_names = CLASS_NAMES
             self.model_label.setText("Model: Failed to load - Video only mode")
+    
+    def _load_video_from_config(self):
+        """Load video path from config file and show first frame if available"""
+        try:
+            config_path = os.path.join(os.path.dirname(__file__), '..', 'config.json')
+            with open(config_path, 'r') as f:
+                cfg = json.load(f)
+        except Exception as e:
+            print(f"Failed to load config: {e}")
+            return
+        
+        video_path = cfg.get("video_path")
+        if video_path:
+            # Make path absolute relative to project root (where config.json is)
+            if not os.path.isabs(video_path):
+                project_root = os.path.dirname(os.path.dirname(__file__))
+                video_path = os.path.join(project_root, video_path)
+            
+            if os.path.exists(video_path):
+                self.video_path = video_path
+                
+                # Setup video info
+                self.seek_cap = cv2.VideoCapture(self.video_path)
+                if not self.seek_cap.isOpened():
+                    print(f"Failed to open video: {self.video_path}")
+                    self.video_path = None
+                    return
+                
+                # Extract video properties for time-based navigation
+                self.video_fps = self.seek_cap.get(cv2.CAP_PROP_FPS)
+                if self.video_fps <= 0:
+                    self.video_fps = 30.0  # Default fallback
+                
+                total_frames = int(self.seek_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                self.video_duration = total_frames / self.video_fps
+                
+                # Timeline setup (time-based)
+                self.timeline_slider.setMaximum(1000)  # 1000 steps for precise control
+                self.timeline_slider.setValue(0)
+                self.current_time = 0.0
+                
+                # Update time display
+                self._update_time_display()
+                print(f"Video loaded from config: {total_frames} frames, {self.video_duration:.2f}s duration, {self.video_fps:.2f} FPS")
+                
+                # Reset traffic status for new video
+                self._reset_traffic_status()
+                
+                # Show first frame immediately
+                ret, frame = self.seek_cap.read()
+                if ret:
+                    self.video_canvas.set_frame(frame)
+                    print("First frame displayed")
+                else:
+                    print("Failed to read first frame")
+            else:
+                print(f"Video path in config does not exist: {video_path}")
+        else:
+            print("No video_path specified in config.json")
 
     def _populate_class_checkboxes(self):
         # clear existing

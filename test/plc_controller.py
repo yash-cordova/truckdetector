@@ -46,7 +46,7 @@ class PLCThread(Thread):
 
     def load_config(self):
         """Load PLC configuration from main config.json file"""
-        config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+        config_path = os.path.join(os.path.dirname(__file__), '..', 'config.json')
         try:
             with open(config_path, 'r') as f:
                 full_config = json.load(f)
