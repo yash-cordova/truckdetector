@@ -311,22 +311,6 @@ class MainWindow(QMainWindow):
         """)
         traffic_layout.addWidget(self.status_label)
         
-        # PLC Connection Status Label
-        self.plc_status_label = QLabel("PLC: Checking...")
-        self.plc_status_label.setAlignment(Qt.AlignCenter)
-        self.plc_status_label.setStyleSheet("""
-            QLabel {
-                font-size: 12px;
-                font-weight: bold;
-                padding: 6px;
-                border: 1px solid #ccc;
-                border-radius: 5px;
-                background-color: #fff9c4;
-                color: #f57f17;
-            }
-        """)
-        traffic_layout.addWidget(self.plc_status_label)
-        
         
         traffic_group.setLayout(traffic_layout)
         controls_layout.addWidget(traffic_group)
@@ -380,16 +364,11 @@ class MainWindow(QMainWindow):
         # Initialize and start PLC thread for physical traffic light
         try:
             self.plc_thread = PLCThread()
-            # Set callback to update PLC status label
-            self.plc_thread.set_callback(self._on_plc_status_changed)
             self.plc_thread.start()
             print("PLC thread started")
-            # Check connection immediately after a short delay
-            QTimer.singleShot(500, lambda: self._check_plc_connection_initial())
         except Exception as e:
             print(f"Failed to start PLC thread: {e}")
             self.plc_thread = None
-            self._update_plc_status_label(False)
         
         # Enable keyboard shortcuts
         self.setFocusPolicy(Qt.StrongFocus)
@@ -1296,51 +1275,6 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"Error updating PLC light: {e}")
 
-    def _check_plc_connection_initial(self):
-        """Check PLC connection status initially"""
-        if self.plc_thread and self.plc_thread.is_alive():
-            try:
-                self.plc_thread.check_connection()
-            except Exception as e:
-                print(f"Error checking initial PLC connection: {e}")
-                self._update_plc_status_label(False)
-    
-    def _on_plc_status_changed(self, status_data):
-        """Callback for PLC status changes - thread-safe UI update"""
-        if status_data.get('type') == 'connection':
-            is_connected = status_data.get('status', False)
-            # Use QTimer to ensure UI update happens on main thread
-            QTimer.singleShot(0, lambda: self._update_plc_status_label(is_connected))
-    
-    def _update_plc_status_label(self, is_connected):
-        """Update PLC connection status label"""
-        if is_connected:
-            self.plc_status_label.setText("PLC: Connected")
-            self.plc_status_label.setStyleSheet("""
-                QLabel {
-                    font-size: 12px;
-                    font-weight: bold;
-                    padding: 6px;
-                    border: 1px solid #4CAF50;
-                    border-radius: 5px;
-                    background-color: #c8e6c9;
-                    color: #2E7D32;
-                }
-            """)
-        else:
-            self.plc_status_label.setText("PLC: Disconnected")
-            self.plc_status_label.setStyleSheet("""
-                QLabel {
-                    font-size: 12px;
-                    font-weight: bold;
-                    padding: 6px;
-                    border: 1px solid #ccc;
-                    border-radius: 5px;
-                    background-color: #ffcccc;
-                    color: #cc0000;
-                }
-            """)
-    
     def _reset_traffic_status(self):
         """Reset traffic status to initial state"""
         if self.truck_monitor:

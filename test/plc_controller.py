@@ -27,6 +27,20 @@ class PLCThread(Thread):
         self.last_light_state = None
         self.lock = RLock()  # Reentrant lock for thread safety (allows nested locking)
 
+    def _is_client_open(self):
+        """Helper method to check if client is open (handles both property and method)"""
+        try:
+            if hasattr(self.client, 'is_open'):
+                # Check if it's callable (method) or not (property)
+                attr = getattr(self.client, 'is_open')
+                if callable(attr):
+                    return attr()
+                else:
+                    return bool(attr)
+            return False
+        except Exception:
+            return False
+
     def load_config(self):
         """Load PLC configuration from main config.json file"""
         config_path = os.path.join(os.path.dirname(__file__), 'config.json')
@@ -78,9 +92,12 @@ class PLCThread(Thread):
         """Check PLC connection status"""
         with self.lock:
             try:
+                # Check if connection is open using helper method
+                is_open = self._is_client_open()
+                
                 # Try to read from the PLC to verify connection
                 input_result = self.client.read_discrete_inputs(0, 7)
-                is_connected = input_result is not None and self.client.is_open
+                is_connected = input_result is not None and is_open
                 
                 if self.connection_status != is_connected:
                     self.connection_status = is_connected
@@ -112,7 +129,9 @@ class PLCThread(Thread):
                 if not self.connection_status:
                     # Try to reconnect
                     try:
-                        if not self.client.is_open:
+                        # Handle is_open as property or method
+                        is_open = self._is_client_open()
+                        if not is_open:
                             self.client.open()
                         self.connection_status = self.check_connection()
                     except Exception as e:
@@ -139,14 +158,14 @@ class PLCThread(Thread):
     def redlight(self):
         """Turn on red light on PLC"""
         try:
-            if self.client.is_open:
+            if self._is_client_open():
                 self.client.write_multiple_coils(0, self.config['light_settings']['red_light_coil'])
                 print("PLC: Red light ON")
             else:
                 print("PLC: Red light - Connection closed, attempting to reconnect...")
                 try:
                     self.client.open()
-                    if self.client.is_open:
+                    if self._is_client_open():
                         self.client.write_multiple_coils(0, self.config['light_settings']['red_light_coil'])
                         print("PLC: Red light ON (after reconnect)")
                 except Exception as reconnect_error:
@@ -157,14 +176,14 @@ class PLCThread(Thread):
     def greenlight(self):
         """Turn on green light on PLC"""
         try:
-            if self.client.is_open:
+            if self._is_client_open():
                 self.client.write_multiple_coils(0, self.config['light_settings']['green_light_coil'])
                 print("PLC: Green light ON")
             else:
                 print("PLC: Green light - Connection closed, attempting to reconnect...")
                 try:
                     self.client.open()
-                    if self.client.is_open:
+                    if self._is_client_open():
                         self.client.write_multiple_coils(0, self.config['light_settings']['green_light_coil'])
                         print("PLC: Green light ON (after reconnect)")
                 except Exception as reconnect_error:
@@ -175,14 +194,14 @@ class PLCThread(Thread):
     def yellowlight(self):
         """Turn on yellow/orange light on PLC"""
         try:
-            if self.client.is_open:
+            if self._is_client_open():
                 self.client.write_multiple_coils(0, self.config['light_settings']['yellow_light_coil'])
                 print("PLC: Yellow light ON")
             else:
                 print("PLC: Yellow light - Connection closed, attempting to reconnect...")
                 try:
                     self.client.open()
-                    if self.client.is_open:
+                    if self._is_client_open():
                         self.client.write_multiple_coils(0, self.config['light_settings']['yellow_light_coil'])
                         print("PLC: Yellow light ON (after reconnect)")
                 except Exception as reconnect_error:
@@ -194,7 +213,7 @@ class PLCThread(Thread):
         """Stop the PLC thread"""
         self.running = False
         try:
-            if self.client.is_open:
+            if self._is_client_open():
                 self.client.close()
         except Exception as e:
             print(f"Error closing PLC connection: {str(e)}")
