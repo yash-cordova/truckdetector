@@ -1,8 +1,9 @@
 from pyModbusTCP.client import ModbusClient
-from threading import Thread, RLock
+from threading import Thread
 import time
 import json
 import os
+import queue
 
 class PLCThread(Thread):
     def __init__(self):
@@ -25,7 +26,9 @@ class PLCThread(Thread):
         self.running = True
         self.callback = None
         self.last_light_state = None
-        self.lock = RLock()  # Reentrant lock for thread safety (allows nested locking)
+        
+        # Queue-based communication (non-blocking for UI thread)
+        self.light_state_queue = queue.Queue(maxsize=1)  # Only keep latest state
 
     def _is_client_open(self):
         """Helper method to check if client is open (handles both property and method)"""
@@ -89,71 +92,112 @@ class PLCThread(Thread):
         self.callback = callback
 
     def check_connection(self):
-        """Check PLC connection status"""
-        with self.lock:
+        """Check PLC connection status - called from PLC thread only"""
+        try:
+            # Check if connection is open using helper method
+            is_open = self._is_client_open()
+            
+            # Try to read from the PLC to verify connection (BLOCKING - but in PLC thread)
+            # Use timeout to avoid long blocking
             try:
-                # Check if connection is open using helper method
-                is_open = self._is_client_open()
-                
-                # Try to read from the PLC to verify connection
                 input_result = self.client.read_discrete_inputs(0, 7)
                 is_connected = input_result is not None and is_open
-                
-                if self.connection_status != is_connected:
-                    self.connection_status = is_connected
-                    if self.callback:
+            except Exception:
+                is_connected = False
+            
+            if self.connection_status != is_connected:
+                self.connection_status = is_connected
+                if self.callback:
+                    try:
                         self.callback({
                             'type': 'connection',
                             'status': is_connected
                         })
-                
-                return is_connected
-            except Exception as e:
-                print(f"PLC Connection Error: {str(e)}")
-                if self.connection_status:
-                    self.connection_status = False
-                    if self.callback:
+                    except Exception:
+                        pass  # Ignore callback errors
+            
+            return is_connected
+        except Exception as e:
+            print(f"PLC Connection Error: {str(e)}")
+            if self.connection_status:
+                self.connection_status = False
+                if self.callback:
+                    try:
                         self.callback({
                             'type': 'connection',
                             'status': False
                         })
-                return False
+                    except Exception:
+                        pass
+            return False
 
     def update_light_state(self, state):
-        """Update light state - state can be 'red', 'yellow', or 'green'"""
-        with self.lock:
-            # Only update if state has changed
-            if self.last_light_state != state:
-                self.last_light_state = state
-                
-                if not self.connection_status:
-                    # Try to reconnect
-                    try:
-                        # Handle is_open as property or method
-                        is_open = self._is_client_open()
-                        if not is_open:
-                            self.client.open()
-                        self.connection_status = self.check_connection()
-                    except Exception as e:
-                        print(f"PLC Reconnection Error: {str(e)}")
-                
-                if state == 'red':
-                    self.redlight()
-                elif state == 'yellow':
-                    self.yellowlight()
-                elif state == 'green':
-                    self.greenlight()
+        """Update light state - NON-BLOCKING for UI thread
+        Puts state in queue, PLC thread will process it
+        """
+        try:
+            # Clear queue and put new state (only keep latest)
+            try:
+                self.light_state_queue.get_nowait()
+            except queue.Empty:
+                pass  # Queue was empty, which is fine
+            
+            self.light_state_queue.put_nowait(state)
+        except queue.Full:
+            # Shouldn't happen with maxsize=1, but just in case
+            try:
+                self.light_state_queue.get_nowait()
+                self.light_state_queue.put_nowait(state)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"Error queuing PLC light state: {e}")
 
     def run(self):
-        """Main PLC thread loop - checks connection periodically"""
+        """Main PLC thread loop - processes all blocking operations here"""
+        connection_check_counter = 0
+        connection_check_interval = self.config['plc_settings']['check_interval']
+        
         while self.running:
             try:
-                # Check PLC connection periodically
-                self.check_connection()
+                # Process light state updates from queue (non-blocking check)
+                try:
+                    state = self.light_state_queue.get_nowait()
+                    if self.last_light_state != state:
+                        self.last_light_state = state
+                        
+                        # Ensure connection before updating light
+                        if not self.connection_status:
+                            try:
+                                is_open = self._is_client_open()
+                                if not is_open:
+                                    self.client.open()
+                                # Re-check connection
+                                self.check_connection()
+                            except Exception as e:
+                                print(f"PLC Reconnection Error: {str(e)}")
+                        
+                        # Update light (all blocking operations in this thread)
+                        if state == 'red':
+                            self.redlight()
+                        elif state == 'yellow':
+                            self.yellowlight()
+                        elif state == 'green':
+                            self.greenlight()
+                except queue.Empty:
+                    pass  # No state update pending
+                
+                # Check connection periodically (less frequently)
+                connection_check_counter += 0.1
+                if connection_check_counter >= connection_check_interval:
+                    connection_check_counter = 0
+                    self.check_connection()
+                    
             except Exception as e:
                 print(f"PLC Error: {str(e)}")
             
-            time.sleep(self.config['plc_settings']['check_interval'])
+            # Small sleep to prevent CPU spinning
+            time.sleep(0.1)
 
     def redlight(self):
         """Turn on red light on PLC"""

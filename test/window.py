@@ -463,33 +463,64 @@ class MainWindow(QMainWindow):
             self._stop_threads()
 
     def _on_frame_with_detections(self, frame, tracked_detections, frame_number):
-        """Handle frame with detections from simple processor"""
+        """Handle frame with detections from simple processor - optimized for UI responsiveness"""
         try:
-            # Update timeline
+            # Quick timeline update (lightweight operations only)
             if not self._timeline_dragging and self.is_playing:
                 current_time = frame_number / self.video_fps
                 self.current_time = current_time
                 slider_value = int((current_time / self.video_duration) * 1000) if self.video_duration > 0 else 0
                 slider_value = max(0, min(1000, slider_value))
-                self.timeline_slider.blockSignals(True)
-                self.timeline_slider.setValue(slider_value)
-                self.timeline_slider.blockSignals(False)
-                self._update_time_display()
+                
+                # Only update slider if value changed significantly (reduce UI updates)
+                if abs(self.timeline_slider.value() - slider_value) > 1:
+                    self.timeline_slider.blockSignals(True)
+                    self.timeline_slider.setValue(slider_value)
+                    self.timeline_slider.blockSignals(False)
+                    
+                # Debounce time display update (update less frequently)
+                if not hasattr(self, '_last_time_update') or time.time() - self._last_time_update > 0.1:
+                    self._update_time_display()
+                    self._last_time_update = time.time()
             
-            # Process truck monitoring - ALWAYS call this to update truck state
-            # Even if no detections, we need to update states (e.g., when person leaves)
-                self._process_truck_monitoring(tracked_detections, frame)
-            
-            # Draw detections
+            # Draw detections first (lightweight) - show frame immediately for smooth playback
             if tracked_detections and self.detector:
                 frame = self._draw_detections_with_ids(frame, tracked_detections)
-                avg_conf = sum(d[4] for d in tracked_detections) / len(tracked_detections)
-                self.summary_label.setText(f"Detections: {len(tracked_detections)} | Avg conf: {avg_conf:.2f}")
-            else:
-                self.summary_label.setText("Detections: 0 | Avg conf: -")
             
-            # Update display
+            # Update display immediately (before heavy processing)
             self.video_canvas.set_frame(frame)
+            
+            # Process truck monitoring - use QTimer to defer heavy processing
+            # This prevents blocking the signal handler
+            if not hasattr(self, '_monitoring_timer'):
+                self._monitoring_timer = QTimer()
+                self._monitoring_timer.setSingleShot(True)
+                self._monitoring_data = None
+                
+                def process_monitoring():
+                    """Process monitoring logic in a deferred callback"""
+                    try:
+                        data = self._monitoring_data
+                        if data:
+                            detections, frame = data
+                            self._process_truck_monitoring(detections, frame)
+                            
+                            # Update summary label (deferred)
+                            if detections:
+                                avg_conf = sum(d[4] for d in detections) / len(detections)
+                                self.summary_label.setText(f"Detections: {len(detections)} | Avg conf: {avg_conf:.2f}")
+                            else:
+                                self.summary_label.setText("Detections: 0 | Avg conf: -")
+                    except Exception as e:
+                        print(f"Error in deferred monitoring: {e}")
+                
+                # Connect once
+                self._monitoring_timer.timeout.connect(process_monitoring)
+            
+            # Store data and schedule processing
+            self._monitoring_data = (tracked_detections, frame)
+            if not self._monitoring_timer.isActive():
+                self._monitoring_timer.start(10)  # Process after 10ms (non-blocking)
             
         except Exception as e:
             print(f"Error in _on_frame_with_detections: {e}")
@@ -1268,9 +1299,10 @@ class MainWindow(QMainWindow):
                 }
             """)
         
-        # Update physical PLC light if PLC thread is running
+        # Update physical PLC light if PLC thread is running (truly non-blocking via queue)
         if self.plc_thread and self.plc_thread.is_alive():
             try:
+                # This just puts state in queue - non-blocking operation
                 self.plc_thread.update_light_state(active_light)
             except Exception as e:
                 print(f"Error updating PLC light: {e}")
@@ -1404,9 +1436,7 @@ class MainWindow(QMainWindow):
             return  # Skip if no detector or invalid frame
             
         try:
-            print("Running detection async...")
-            
-            # Use threading to prevent UI blocking
+            # Use threading to prevent UI blocking - NO JOIN to avoid blocking UI thread
             import threading
             detection_result = [None]
             detection_error = [None]
@@ -1418,50 +1448,58 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     detection_error[0] = e
             
-            # Start detection in a separate thread with timeout
+            def on_detection_complete():
+                """Callback when detection completes - runs on main thread"""
+                try:
+                    if detection_error[0]:
+                        print(f"Detection error: {detection_error[0]}")
+                        detections = []
+                    else:
+                        detections = detection_result[0] or []
+                    
+                    if detections:
+                        selected_ids = self._selected_class_ids()
+                        if selected_ids is not None:
+                            detections = [d for d in detections if d[5] in selected_ids]
+                        
+                        # Process truck monitoring logic for traffic status
+                        self._process_truck_monitoring(detections, frame)
+                        
+                        # Update frame with detections
+                        frame_with_detections = self._draw_detections_with_ids(frame, detections)
+                        self.video_canvas.set_frame(frame_with_detections)
+                        
+                        # Update detection summary
+                        if detections:
+                            avg_conf = sum(d[4] for d in detections) / len(detections)
+                            self.summary_label.setText(f"Detections: {len(detections)} | Avg conf: {avg_conf:.2f}")
+                        else:
+                            self.summary_label.setText("Detections: 0 | Avg conf: -")
+                    else:
+                        # No detections - still process truck monitoring to reset states
+                        self._process_truck_monitoring([], frame)
+                        self.summary_label.setText("Detections: 0 | Avg conf: -")
+                except Exception as e:
+                    print(f"Error in detection callback: {e}")
+            
+            # Start detection in a separate thread (non-blocking)
             detection_thread = threading.Thread(target=run_detection)
             detection_thread.daemon = True
             detection_thread.start()
-            detection_thread.join(timeout=0.2)  # 200ms timeout
             
-            if detection_thread.is_alive():
-                # Detection timed out, use empty result
-                print("Detection timeout, using empty result")
-                detections = []
-            elif detection_error[0]:
-                print(f"Detection error: {detection_error[0]}")
-                detections = []
-            else:
-                detections = detection_result[0] or []
-            
-            print(f"Detection result: {len(detections) if detections else 0} detections")
-            
-            if detections:
-                selected_ids = self._selected_class_ids()
-                if selected_ids is not None:
-                    detections = [d for d in detections if d[5] in selected_ids]
-                
-                print(f"Filtered detections: {len(detections)} detections")
-                
-                # Process truck monitoring logic for traffic status - ALWAYS UPDATE
-                self._process_truck_monitoring(detections, frame)
-                
-                # Update frame with detections
-                frame_with_detections = self._draw_detections_with_ids(frame, detections)
-                self.video_canvas.set_frame(frame_with_detections)
-                
-                # Update detection summary
-                if detections:
-                    avg_conf = sum(d[4] for d in detections) / len(detections)
-                    self.summary_label.setText(f"Detections: {len(detections)} | Avg conf: {avg_conf:.2f}")
+            # Use QTimer to check completion instead of blocking join()
+            # Check if thread is done every 50ms (non-blocking)
+            def check_thread():
+                if not detection_thread.is_alive():
+                    # Thread finished, process results
+                    on_detection_complete()
                 else:
-                    self.summary_label.setText("Detections: 0 | Avg conf: -")
-            else:
-                # No detections - still process truck monitoring to reset states - ALWAYS UPDATE
-                print("No detections found, processing truck monitoring...")
-                self._process_truck_monitoring([], frame)
-                # Update detection summary
-                self.summary_label.setText("Detections: 0 | Avg conf: -")
+                    # Still running, check again in 50ms
+                    QTimer.singleShot(50, check_thread)
+            
+            # Start checking after 50ms
+            QTimer.singleShot(50, check_thread)
+            
         except Exception as e:
             print(f"Async detection error: {e}")
 
