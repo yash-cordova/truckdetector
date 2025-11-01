@@ -1,12 +1,11 @@
 # MainWindow class extracted from main.py
 # Imports
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtWidgets import (QMainWindow, QWidget, QFileDialog, QLabel, QPushButton, QLineEdit, QHBoxLayout, QVBoxLayout, QSplitter, QGroupBox, QFormLayout, QSizePolicy, QCheckBox, QSlider)
+from PyQt5.QtWidgets import (QMainWindow, QWidget, QFileDialog, QLabel, QPushButton, QLineEdit, QHBoxLayout, QVBoxLayout, QSplitter, QGroupBox, QFormLayout, QSizePolicy, QSlider)
 from PyQt5.QtCore import Qt, QTimer, QMutex
 import cv2
 import time
 import json
-import queue
 import threading
 from detector import YoloV5Detector, CLASS_NAMES
 from canvas import VideoCanvas
@@ -38,6 +37,7 @@ class MainWindow(QMainWindow):
         # Timeline state management
         self.is_playing = False
         self._timeline_dragging = False
+        self._was_playing_before_drag = False  # Track if video was playing before slider drag
         
         # Video properties for time-based navigation
         self.video_fps = 30.0  # Default FPS
@@ -70,16 +70,7 @@ class MainWindow(QMainWindow):
         self.parking_duration_seconds = None  # Will be loaded from config.json
         self.truck_monitor = None  # Will be initialized after config loads
         
-        # OC-SORT tracking configuration
-        self.use_ocsort_tracking = True  # Enable OC-SORT tracking
-        self.ocsort_max_age = 30  # Maximum frames to keep lost tracks
-        self.ocsort_min_hits = 3  # Minimum hits to confirm track
-        self.ocsort_iou_threshold = 0.3  # IoU threshold for association
-        self.ocsort_distance_threshold = 50  # Distance threshold for association
-        self.ocsort_velocity_threshold = 10  # Velocity threshold for association
-        
         # Configuration
-        self.detection_confidence_min = 0.3  # minimum confidence for detection
 
         # Right: video canvas
         self.video_canvas = VideoCanvas()
@@ -97,9 +88,6 @@ class MainWindow(QMainWindow):
         self.btn_full = QPushButton("Fullscreen Video")
         self.btn_full.clicked.connect(self.on_toggle_fullscreen)
         
-        # Skip frames checkbox
-        self.skip_frames_cb = QCheckBox("Skip frames when buffer full")
-        self.skip_frames_cb.setChecked(True)
 
         # ROI inputs - 10 boxes for 5 corners (x,y for each corner)
         self.input_corner1_x = QLineEdit("900")
@@ -215,7 +203,6 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.btn_start)
         controls_layout.addWidget(self.btn_stop)
         controls_layout.addWidget(self.btn_full)
-        controls_layout.addWidget(self.skip_frames_cb)
         
         controls_layout.addWidget(roi_group)
         # Detection summary
@@ -441,7 +428,6 @@ class MainWindow(QMainWindow):
             self.video_processor_thread = SimpleVideoProcessor(
                 self.video_path, 
                 self.detector, 
-                self.video_canvas.roi,
                 start_frame=0,
                 frame_skip_interval=self.frame_skip_interval
             )
@@ -732,30 +718,7 @@ class MainWindow(QMainWindow):
             pass
             
     # Removed _on_frame_ready - now using _on_frame_with_detections
-            
-    def _on_detection_complete(self, frame, detections, frame_number):
-        """Handle detection complete signal - send to tracking thread"""
-        # Send detections to tracking thread
-        if self.tracking_thread:
-            self.tracking_thread.add_detection(frame, detections, frame_number)
-            
-    def _on_tracking_complete(self, frame, tracked_detections, frame_number):
-        """Handle tracking complete signal - final processing"""
-        # Process truck monitoring logic for traffic status
-        self._process_truck_monitoring(tracked_detections, frame)
-        
-        # Update frame with detections
-        frame_with_detections = self._draw_detections_with_ids(frame, tracked_detections)
-        self.video_canvas.set_frame(frame_with_detections)
-        
-        # Update detection summary
-        if tracked_detections:
-            avg_conf = sum(d[4] for d in tracked_detections) / len(tracked_detections)
-            self.summary_label.setText(f"Detections: {len(tracked_detections)} | Avg conf: {avg_conf:.2f}")
-        else:
-            self.summary_label.setText("Detections: 0 | Avg conf: -")
-        
-    # _on_detection_ready removed - functionality merged into _on_frame_with_detections
+    # Removed _on_detection_ready - functionality merged into _on_frame_with_detections
         
     def _stop_threads(self):
         try:
@@ -773,28 +736,6 @@ class MainWindow(QMainWindow):
                 finally:
                     self.video_processor_thread = None
                     
-            # Stop YOLO processor if exists
-            if hasattr(self, 'yolo_processor') and self.yolo_processor:
-                try:
-                    self.yolo_processor.stop()
-                    self.yolo_processor.quit()
-                    if not self.yolo_processor.wait(500):
-                        print("YOLO processor thread did not stop gracefully")
-                except Exception as e:
-                    print(f"Error stopping yolo processor: {e}")
-                finally:
-                    self.yolo_processor = None
-                
-            # Clear buffer safely
-            try:
-                while not self.buffer.empty():
-                    try:
-                        self.buffer.get_nowait()
-                        self.buffer.task_done()
-                    except (queue.Empty, AttributeError):
-                        break
-            except Exception as e:
-                print(f"Error clearing buffer: {e}")
                     
             # Cancel any pending operations
             self.pending_seek_time = None
@@ -860,6 +801,9 @@ class MainWindow(QMainWindow):
             self.operation_lock = True
             self.operation_mutex.unlock()
             
+            # Remember if video was playing before drag
+            self._was_playing_before_drag = self.is_playing
+            
             self.is_playing = False
             self._stop_threads()
             self._timeline_dragging = True
@@ -901,8 +845,8 @@ class MainWindow(QMainWindow):
             # Show frame with detection (this will trigger truck monitoring)
             self._show_frame_at_time(self.current_time)
             
-            # Auto-start video from current position if not already playing
-            if not self.is_playing and self.video_path:
+            # Resume video playback if it was playing before drag, or auto-start if video path exists
+            if self._was_playing_before_drag or (not self.is_playing and self.video_path):
                 # Use a longer delay to prevent conflicts
                 QTimer.singleShot(500, self._safe_start_video)
             else:
@@ -963,65 +907,6 @@ class MainWindow(QMainWindow):
         if not detections or not self.detector:
             return frame
         return draw_detections_with_ids(frame, detections, self.model_names, self.video_canvas.roi)
-        
-    def _assign_unique_ids(self, detections):
-        """Assign unique IDs to detections based on position and class"""
-        if not self.tracking_enabled:
-            return detections
-            
-        current_frame_objects = []
-        
-        for detection in detections:
-            x1, y1, x2, y2, conf, class_id = detection[:6]
-            center_x = (x1 + x2) / 2
-            center_y = (y1 + y2) / 2
-            
-            # Find closest existing tracked object
-            best_match_id = None
-            best_distance = float('inf')
-            
-            for obj_id, obj_data in self.tracked_objects.items():
-                if obj_data['class_id'] == class_id:
-                    # Calculate distance from last known position
-                    last_pos = obj_data['last_position']
-                    distance = ((center_x - last_pos[0])**2 + (center_y - last_pos[1])**2)**0.5
-                    
-                    if distance < self.tracking_distance_threshold and distance < best_distance:
-                        best_distance = distance
-                        best_match_id = obj_id
-            
-            # Assign ID
-            if best_match_id is not None:
-                # Update existing tracked object
-                obj_id = best_match_id
-                self.tracked_objects[obj_id]['last_position'] = (center_x, center_y)
-                self.tracked_objects[obj_id]['frames_since_last_seen'] = 0
-                self.tracked_objects[obj_id]['last_detection'] = detection
-            else:
-                # Create new tracked object
-                self.detection_id_counter += 1
-                obj_id = self.detection_id_counter
-                self.tracked_objects[obj_id] = {
-                    'class_id': class_id,
-                    'last_position': (center_x, center_y),
-                    'frames_since_last_seen': 0,
-                    'first_seen_frame': self.detection_id_counter,
-                    'last_detection': detection
-                }
-            
-            # Add ID to detection
-            detection_with_id = detection + (obj_id,)
-            current_frame_objects.append(detection_with_id)
-        
-        # Update frames_since_last_seen for all tracked objects
-        for obj_id in list(self.tracked_objects.keys()):
-            self.tracked_objects[obj_id]['frames_since_last_seen'] += 1
-            
-            # Remove old objects
-            if self.tracked_objects[obj_id]['frames_since_last_seen'] > self.max_tracking_frames:
-                del self.tracked_objects[obj_id]
-        
-        return current_frame_objects
         
     def _process_truck_monitoring(self, detections, frame):
         """Main truck monitoring logic - uses TruckMonitor class"""
@@ -1589,7 +1474,6 @@ class MainWindow(QMainWindow):
             self.video_processor_thread = SimpleVideoProcessor(
                 self.video_path,
                 self.detector,
-                self.video_canvas.roi,
                 start_frame=start_frame,
                 frame_skip_interval=self.frame_skip_interval
             )
@@ -1621,19 +1505,11 @@ class MainWindow(QMainWindow):
                 "inference_size": 640, 
                 "confidence_threshold": 0.35, 
                 "iou_threshold": 0.45,
-                "detection_confidence_min": 0.3,
                 "parking_duration_seconds": 5.0,
-                "buffer_size": 20,
-                "use_ocsort_tracking": True,
-                "ocsort_max_age": 30,
-                "ocsort_min_hits": 2,
-                "ocsort_iou_threshold": 0.2,
-                "ocsort_distance_threshold": 100,
-                "ocsort_velocity_threshold": 50
+                "frame_skip_interval": 1
             }
         
         # Load truck monitoring configuration
-        self.detection_confidence_min = cfg.get("detection_confidence_min", 0.3)
         self.parking_duration_seconds = cfg.get("parking_duration_seconds", 5.0)
         
         # Initialize truck monitor
@@ -1643,13 +1519,6 @@ class MainWindow(QMainWindow):
         self.frame_skip_interval = cfg.get("frame_skip_interval", 1)
         self.frame_skip_count = 0
         
-        # Load OC-SORT configuration
-        self.use_ocsort_tracking = cfg.get("use_ocsort_tracking", True)
-        self.ocsort_max_age = cfg.get("ocsort_max_age", 30)
-        self.ocsort_min_hits = cfg.get("ocsort_min_hits", 3)
-        self.ocsort_iou_threshold = cfg.get("ocsort_iou_threshold", 0.3)
-        self.ocsort_distance_threshold = cfg.get("ocsort_distance_threshold", 50)
-        self.ocsort_velocity_threshold = cfg.get("ocsort_velocity_threshold", 10)
         
         self.model_label.setText("Loading model...")
         QtWidgets.QApplication.processEvents()
