@@ -12,9 +12,9 @@ class HumanPresence(str, Enum):
     NOT_PRESENT = "not_present"
 
 class DockStatus(str, Enum):
-    IDLE = "idle"
-    OCCUPIED = "occupied"
-    MAINTENANCE = "maintenance"
+    RED = "RED"
+    YELLOW = "YELLOW"
+    GREEN = "GREEN"
 
 class DockData(BaseModel):
     dock_id: str
