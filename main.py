@@ -225,5 +225,66 @@ async def update_dock_status(update_data: DockUpdate):
         logger.error(f"Error updating dock status: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to update dock status: {str(e)}")
 
+# Analytics API - Human Violation (RED status)
+@app.get("/analytics/human-violation")
+async def get_human_violation_analytics(year: int, month: int):
+    """
+    Get Human Violation analytics for a given month.
+    Returns day-wise count of RED status (Human Violation) occurrences.
+    
+    Query Parameters:
+        year: Year (e.g., 2024)
+        month: Month (1-12)
+    
+    Returns:
+        Dictionary with day-wise counts of RED status
+    """
+    try:
+        if not (1 <= month <= 12):
+            raise HTTPException(status_code=400, detail="Month must be between 1 and 12")
+        
+        analytics = await dock_service.get_human_violation_analytics(year, month)
+        
+        if "error" in analytics:
+            raise HTTPException(status_code=500, detail=analytics["error"])
+        
+        return analytics
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting human violation analytics: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get human violation analytics: {str(e)}")
+
+# Analytics API - Idle Condition (Used Time)
+@app.get("/analytics/idle-condition")
+async def get_idle_condition_analytics(year: int, month: int):
+    """
+    Get Idle Condition analytics for a given month.
+    Calculates total used time (in minutes) when vehicle_status was "placed" 
+    until it changed to "not_placed", grouped by day.
+    
+    Query Parameters:
+        year: Year (e.g., 2024)
+        month: Month (1-12)
+    
+    Returns:
+        Dictionary with day-wise total used minutes (when truck is in placed state)
+    """
+    try:
+        if not (1 <= month <= 12):
+            raise HTTPException(status_code=400, detail="Month must be between 1 and 12")
+        
+        analytics = await dock_service.get_idle_condition_analytics(year, month)
+        
+        if "error" in analytics:
+            raise HTTPException(status_code=500, detail=analytics["error"])
+        
+        return analytics
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting idle condition analytics: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get idle condition analytics: {str(e)}")
+
 if __name__ == "__main__":
     uvicorn.run(app, host=settings.SERVER_HOST, port=settings.SERVER_PORT)

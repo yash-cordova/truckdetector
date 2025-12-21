@@ -381,6 +381,268 @@ class DockService:
         except Exception as e:
             logger.error(f"Error updating dock status: {str(e)}")
             raise
+    
+    async def get_human_violation_analytics(self, year: int, month: int) -> Dict[str, Any]:
+        """
+        Get Human Violation analytics (DockStatus = RED) for a given month.
+        Returns day-wise count of RED status occurrences.
+        
+        Args:
+            year: Year (e.g., 2024)
+            month: Month (1-12)
+        
+        Returns:
+            Dictionary with day-wise counts
+        """
+        try:
+            if dock1_collection is None:
+                logger.warning("MongoDB collection not available")
+                return {"error": "Database connection not available"}
+            
+            # Create date range for the month
+            start_date = datetime(year, month, 1)
+            if month == 12:
+                end_date = datetime(year + 1, 1, 1)
+            else:
+                end_date = datetime(year, month + 1, 1)
+            
+            # Query documents with RED status in the given month
+            query = {
+                'dock_id': 'dock1',
+                'dock_status': 'RED',
+                'timestamp': {
+                    '$gte': start_date,
+                    '$lt': end_date
+                }
+            }
+            
+            # Get all RED status documents
+            red_docs = list(dock1_collection.find(query).sort('timestamp', 1))
+            
+            # Group by day and count (only days with actual data)
+            day_wise_count = {}
+            for doc in red_docs:
+                timestamp = doc.get('timestamp')
+                if isinstance(timestamp, str):
+                    timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                elif not isinstance(timestamp, datetime):
+                    continue  # Skip if timestamp is not valid
+                
+                # Only include if timestamp is within the month range
+                if start_date <= timestamp < end_date:
+                    day_key = timestamp.strftime('%Y-%m-%d')
+                    day_wise_count[day_key] = day_wise_count.get(day_key, 0) + 1
+            
+            total_violations = len(red_docs)
+            
+            return {
+                'success': True,
+                'year': year,
+                'month': month,
+                'total_violations': total_violations,
+                'day_wise_count': day_wise_count,  # Only days with actual data
+                'timestamp': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting human violation analytics: {str(e)}")
+            raise
+    
+    async def get_idle_condition_analytics(self, year: int, month: int) -> Dict[str, Any]:
+        """
+        Get Idle Condition analytics for a given month.
+        Calculates total used time (in minutes) when vehicle_status was "placed" 
+        until it changed to "not_placed", grouped by day.
+        
+        Args:
+            year: Year (e.g., 2024)
+            month: Month (1-12)
+        
+        Returns:
+            Dictionary with day-wise total used minutes (when truck is in placed state)
+        """
+        try:
+            if dock1_collection is None:
+                logger.warning("MongoDB collection not available")
+                return {"error": "Database connection not available"}
+            
+            # Create date range for the month
+            start_date = datetime(year, month, 1)
+            if month == 12:
+                end_date = datetime(year + 1, 1, 1)
+            else:
+                end_date = datetime(year, month + 1, 1)
+            
+            # Get all documents for the month, sorted by timestamp
+            query = {
+                'dock_id': 'dock1',
+                'timestamp': {
+                    '$gte': start_date,
+                    '$lt': end_date
+                }
+            }
+            
+            docs = list(dock1_collection.find(query).sort('timestamp', 1))
+            
+            if not docs:
+                # No data for this month - return empty
+                return {
+                    'success': True,
+                    'year': year,
+                    'month': month,
+                    'total_used_minutes': 0.0,
+                    'day_wise_used_minutes': {},  # Empty - no data
+                    'timestamp': datetime.now().isoformat()
+                }
+            
+            # Calculate used time periods (when vehicle_status is "placed")
+            # Track transitions between consecutive documents - ONLY within the month
+            day_wise_used_minutes = {}
+            used_start_time = None
+            prev_vehicle_status = None
+            
+            # Get the document just before the month to know the initial state
+            prev_doc_query = {
+                'dock_id': 'dock1',
+                'timestamp': {'$lt': start_date}
+            }
+            prev_doc = dock1_collection.find_one(prev_doc_query, sort=[('timestamp', -1)])
+            if prev_doc:
+                prev_vehicle_status = prev_doc.get('vehicle_status', 'not_placed')
+                # If previous status was "placed", we need to start tracking from month start
+                if prev_vehicle_status == 'placed':
+                    used_start_time = start_date
+            
+            # Filter docs to only those within the month
+            month_docs = []
+            for doc in docs:
+                timestamp = doc.get('timestamp')
+                if isinstance(timestamp, str):
+                    timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                elif not isinstance(timestamp, datetime):
+                    continue
+                
+                if start_date <= timestamp < end_date:
+                    month_docs.append(doc)
+            
+            for i, doc in enumerate(month_docs):
+                timestamp = doc.get('timestamp')
+                if isinstance(timestamp, str):
+                    timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                elif not isinstance(timestamp, datetime):
+                    continue
+                
+                vehicle_status = doc.get('vehicle_status', 'not_placed')
+                
+                # Detect transition from "not_placed" to "placed" (start of used period)
+                if prev_vehicle_status == 'not_placed' and vehicle_status == 'placed':
+                    # Transition: not_placed -> placed (start tracking used time)
+                    used_start_time = timestamp
+                
+                # Detect transition from "placed" to "not_placed" (end of used period)
+                elif prev_vehicle_status == 'placed' and vehicle_status == 'not_placed' and used_start_time is not None:
+                    # Transition: placed -> not_placed (end tracking used time)
+                    # Only calculate time within the month range
+                    end_time = min(timestamp, end_date - timedelta(seconds=1))
+                    start_time = max(used_start_time, start_date)
+                    
+                    if start_time < end_time:
+                        # Distribute used time across days (only within month)
+                        current_time = start_time
+                        while current_time < end_time:
+                            day_key = current_time.strftime('%Y-%m-%d')
+                            day_end = datetime.combine(current_time.date(), datetime.max.time().replace(microsecond=0))
+                            
+                            # Don't go beyond end_time or end of month
+                            actual_end = min(day_end, end_time)
+                            duration = (actual_end - current_time).total_seconds() / 60
+                            
+                            if duration > 0:
+                                if day_key not in day_wise_used_minutes:
+                                    day_wise_used_minutes[day_key] = 0
+                                day_wise_used_minutes[day_key] += duration
+                            
+                            # Move to next day
+                            current_time = day_end + timedelta(seconds=1)
+                            if current_time >= end_time:
+                                break
+                    
+                    # Reset used tracking
+                    used_start_time = None
+                
+                # Update previous state for next iteration
+                prev_vehicle_status = vehicle_status
+            
+            # Handle used period that extends to last document (still placed at last document)
+            # BUT only calculate until the last document's timestamp, NOT beyond
+            if used_start_time is not None and month_docs:
+                last_doc = month_docs[-1]
+                last_timestamp = last_doc.get('timestamp')
+                if isinstance(last_timestamp, str):
+                    last_timestamp = datetime.fromisoformat(last_timestamp.replace('Z', '+00:00'))
+                
+                # CRITICAL: Only calculate until the last document's timestamp
+                # Do NOT extrapolate to end of day or end of month
+                end_time = last_timestamp  # Use exact timestamp, not end of day
+                start_time = max(used_start_time, start_date)
+                
+                # Only calculate if we have a valid time range
+                if start_time < end_time and start_time < end_date:
+                    # Calculate duration directly (no day-by-day distribution needed)
+                    # Since we're only going to the last document's timestamp
+                    duration_minutes = (end_time - start_time).total_seconds() / 60
+                    
+                    if duration_minutes > 0:
+                        # Get the day key for the start time
+                        day_key = start_time.strftime('%Y-%m-%d')
+                        
+                        # If it spans multiple days, distribute it
+                        if start_time.date() == end_time.date():
+                            # Same day - simple calculation
+                            if day_key not in day_wise_used_minutes:
+                                day_wise_used_minutes[day_key] = 0
+                            day_wise_used_minutes[day_key] += duration_minutes
+                        else:
+                            # Spans multiple days - distribute
+                            current_time = start_time
+                            while current_time < end_time:
+                                day_key = current_time.strftime('%Y-%m-%d')
+                                day_end = datetime.combine(current_time.date(), datetime.max.time().replace(microsecond=0))
+                                
+                                # Don't go beyond end_time
+                                actual_end = min(day_end, end_time)
+                                duration = (actual_end - current_time).total_seconds() / 60
+                                
+                                if duration > 0:
+                                    if day_key not in day_wise_used_minutes:
+                                        day_wise_used_minutes[day_key] = 0
+                                    day_wise_used_minutes[day_key] += duration
+                                
+                                current_time = day_end + timedelta(seconds=1)
+                                if current_time >= end_time:
+                                    break
+            
+            # Only return days with actual used time (no zero values)
+            # Round values for days that have data
+            filtered_day_wise = {}
+            for day_key, minutes in day_wise_used_minutes.items():
+                if minutes > 0:  # Only include days with actual used time
+                    filtered_day_wise[day_key] = round(minutes, 2)
+            
+            total_used_minutes = sum(day_wise_used_minutes.values())
+            
+            return {
+                'success': True,
+                'year': year,
+                'month': month,
+                'total_used_minutes': round(total_used_minutes, 2),
+                'day_wise_used_minutes': filtered_day_wise,  # Only days with actual data
+                'timestamp': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting idle condition analytics: {str(e)}")
+            raise
 
 # Global dock service instance
 dock_service = DockService()
