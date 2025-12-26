@@ -5,6 +5,8 @@ from backend.routes.auth import auth_router
 from backend.services.dock_service import dock_service
 from backend.models.dock import DockUpdate
 from backend.core.config import settings
+from backend.core.security import get_password_hash
+from backend.db.mongo import users_collection
 from datetime import datetime
 from typing import List
 import asyncio
@@ -62,10 +64,47 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# Function to create default admin user if it doesn't exist
+def create_default_admin():
+    """Create default admin user if it doesn't exist"""
+    try:
+        if users_collection is None:
+            logger.warning("MongoDB users collection not available, skipping admin user creation")
+            return
+        
+        # Check if admin user already exists
+        admin_user = users_collection.find_one({"email": "admin@admin.com"})
+        
+        if admin_user:
+            logger.info("Default admin user already exists")
+            return
+        
+        # Create default admin user
+        hashed_password = get_password_hash("tata1234")
+        admin_data = {
+            "email": "admin@admin.com",
+            "hashed_password": hashed_password,
+            "full_name": "Admin User",
+            "mobile": "+911234567890",
+            "role": "admin"
+        }
+        
+        users_collection.insert_one(admin_data)
+        logger.info("Default admin user created successfully")
+        logger.info("Email: admin@admin.com")
+        logger.info("Password: tata1234")
+        
+    except Exception as e:
+        logger.error(f"Error creating default admin user: {str(e)}")
+
 # Start change stream task
 @app.on_event("startup")
 async def startup_event():
     """Start the MongoDB change stream when the application starts"""
+    # Create default admin user if it doesn't exist
+    create_default_admin()
+    
+    # Start dock service change stream
     asyncio.create_task(dock_service.start_change_stream())
     logger.info("Started dock service change stream")
 
